@@ -1,11 +1,6 @@
 import { useState } from "react";
 import { Search, ShieldAlert, ShieldCheck, ShieldQuestion, Lock, Unlock, Users, Clock, Flame, ChevronRight } from "lucide-react";
 
-// ---- Real GoPlus Solana Token Security API integration ----
-// This calls OUR OWN backend (api/check.js), which fetches GoPlus
-// server-side and returns the JSON. No CORS issues, no public proxy
-// dependency — see /api/check.js in this project for the backend code.
-
 async function fetchGoPlusAnalysis(address) {
   const res = await fetch(`/api/check?address=${encodeURIComponent(address)}`);
   if (!res.ok) {
@@ -20,8 +15,12 @@ async function fetchGoPlusAnalysis(address) {
   const data = json.result[address.toLowerCase()] ?? json.result[address] ?? Object.values(json.result)[0];
   if (!data) throw new Error("No data returned for this address");
 
-  const mintStatus = data.mintable?.status === "1";
-  const freezeStatus = data.freezable?.status === "1";
+  const isTrusted = data.trusted_token === "1" || data.trusted_token === 1;
+  // For trusted, well-known tokens (like USDC), an active mint/freeze authority
+  // is normal and disclosed — not a rug signal. Only flag these as critical
+  // risks for tokens that AREN'T on GoPlus's trusted list.
+  const mintStatus = data.mintable?.status === "1" && !isTrusted;
+  const freezeStatus = data.freezable?.status === "1" && !isTrusted;
 
   const holders = Array.isArray(data.holders) ? data.holders : [];
   const topHolderPct = Math.round(
@@ -34,7 +33,7 @@ async function fetchGoPlusAnalysis(address) {
     (sum, h) => sum + (h.is_locked === 1 || h.is_locked === "1" ? (parseFloat(h.percent) || 0) * 100 : 0),
     0
   );
-  const lpLocked = lpHolders.length > 0 && lpLockedPct >= 50;
+  const lpLocked = (lpHolders.length > 0 && lpLockedPct >= 50) || isTrusted;
 
   const feeRateRaw = data.transfer_fee?.current_fee_rate?.fee_rate;
   const sellTax = feeRateRaw ? Math.round(parseFloat(feeRateRaw) / 100) : 0;
@@ -45,28 +44,38 @@ async function fetchGoPlusAnalysis(address) {
       id: "lp",
       label: "Liquidity lock",
       pass: lpLocked,
-      detail: dex
+      detail: isTrusted
+        ? "Trusted token — liquidity risk not applicable in the same way"
+        : dex
         ? lpLocked
           ? `~${lpLockedPct}% of LP locked`
           : "LP unlocked or lock not detected — can be pulled anytime"
         : "No DEX liquidity pool found for this token",
-      critical: true,
+      critical: !isTrusted,
       icon: lpLocked ? Lock : Unlock,
     },
     {
       id: "freeze",
       label: "Freeze authority",
       pass: !freezeStatus,
-      detail: !freezeStatus ? "Renounced" : "Deployer can freeze holder wallets",
-      critical: true,
+      detail: isTrusted
+        ? "Held by a recognized, trusted issuer — expected for this token"
+        : !freezeStatus
+        ? "Renounced"
+        : "Deployer can freeze holder wallets",
+      critical: !isTrusted,
       icon: !freezeStatus ? ShieldCheck : ShieldAlert,
     },
     {
       id: "mint",
       label: "Mint authority",
       pass: !mintStatus,
-      detail: !mintStatus ? "Renounced — supply is fixed" : "Deployer can mint more supply",
-      critical: true,
+      detail: isTrusted
+        ? "Held by a recognized, trusted issuer — expected for this token"
+        : !mintStatus
+        ? "Renounced — supply is fixed"
+        : "Deployer can mint more supply",
+      critical: !isTrusted,
       icon: !mintStatus ? ShieldCheck : ShieldAlert,
     },
     {
@@ -80,10 +89,10 @@ async function fetchGoPlusAnalysis(address) {
     {
       id: "holders",
       label: "Holder concentration",
-      pass: topHolderPct < 25,
+      pass: topHolderPct < 25 || isTrusted,
       detail: `Top 10 wallets hold ${topHolderPct}% of supply`,
-      critical: topHolderPct >= 50,
-      icon: topHolderPct >= 50 ? ShieldAlert : Users,
+      critical: topHolderPct >= 50 && !isTrusted,
+      icon: topHolderPct >= 50 && !isTrusted ? ShieldAlert : Users,
     },
     {
       id: "age",
@@ -95,11 +104,23 @@ async function fetchGoPlusAnalysis(address) {
     },
   ];
 
+  if (isTrusted) {
+    checks.push({
+      id: "trusted",
+      label: "Trusted token status",
+      pass: true,
+      detail: "Recognized by GoPlus as a well-known, reputable token",
+      critical: false,
+      icon: ShieldCheck,
+    });
+  }
+
   const criticalFail = checks.some((c) => c.critical && !c.pass);
   const failCount = checks.filter((c) => !c.pass).length;
   let verdict = "green";
   if (criticalFail || failCount >= 3) verdict = "red";
   else if (failCount >= 1) verdict = "yellow";
+  if (isTrusted && !criticalFail) verdict = "green";
 
   return { checks, verdict, address, source: "live", tokenName: data.metadata?.name, tokenSymbol: data.metadata?.symbol };
 }
@@ -398,4 +419,4 @@ export default function RugChecker() {
       </div>
     </div>
   );
-                                                }
+    }
